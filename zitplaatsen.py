@@ -3,12 +3,29 @@ import sys
 import math
 import json
 import shutil
+import tempfile
 import zipfile
+import io
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox, simpledialog
 from tkinter import font as tkfont
 from PIL import Image, ImageTk
-from pdf2image import convert_from_path
+
+# --- Poppler packaging support: when bundled by PyInstaller we add the bundled poppler/bin to PATH
+if getattr(sys, "_MEIPASS", None):
+    # runtime when running from a PyInstaller bundle
+    bundled_poppler_bin = os.path.join(sys._MEIPASS, "poppler", "bin")
+else:
+    # runtime during development
+    bundled_poppler_bin = os.path.join(os.path.abspath("."), "poppler", "bin")
+
+# If the folder exists, prepend to PATH so pdf2image can find pdftoppm / pdftocairo
+if os.path.isdir(bundled_poppler_bin):
+    os.environ["PATH"] = bundled_poppler_bin + os.pathsep + os.environ.get("PATH", "")
+
+# Now import pdf2image (will find poppler via PATH if present)
+from pdf2image import convert_from_path, convert_from_bytes
+
 from reportlab.pdfgen import canvas as pdfcanvas
 from reportlab.lib.pagesizes import A4, landscape, portrait
 from reportlab.lib.utils import ImageReader
@@ -45,8 +62,13 @@ ROW_SPACING = 28
 BANK_SPACING = 24
 
 PAGE_MARGIN_LR = 28
-PAGE_MARGIN_TOP = 56
+PAGE_MARGIN_TOP_PORTRAIT = 28   # kleinere top marge bij portret
+PAGE_MARGIN_TOP_LANDSCAPE = 56  # oorspronkelijke waarde voor liggend
 PAGE_MARGIN_BOTTOM = 24
+
+# Titeldetails (gebruikelijk voor zowel UI als PDF zodat spacing overeenkomt)
+TITLE_Y = 28
+TITLE_GAP_AFTER = 8
 
 FONT_MAX = 12
 FONT_MIN = 7
@@ -55,20 +77,35 @@ FONT_MIN = 7
 # Layouts definitie (incl. default Eigen opstelling)
 # =========================
 LAYOUTS = {
-    "Klas 1 — 5 rijen × 3 banken × 2 stoelen": {
+    "Lang type — 5 rijen × 3 banken × 2 stoelen": {
         "regular": True, "rows": 5, "banks": 3, "seats": 2, "orientation": "portrait"
     },
-    "Klas 2 — 4 rijen × 4 banken × 2 stoelen": {
+    "Breed type — 4 rijen × 4 banken × 2 stoelen": {
         "regular": True, "rows": 4, "banks": 4, "seats": 2, "orientation": "landscape"
     },
-    "Labo T117 — 4 rijen × 2 banken × 4 stoelen": {
+    "Kleine klas — 3 rijen × 4 banken × 2 stoelen": {
+        "regular": True, "rows": 3, "banks": 4, "seats": 2, "orientation": "landscape"
+    },
+    "Grote klas — 6 rijen × 3 banken × 2 stoelen": {
+        "regular": True, "rows": 6, "banks": 3, "seats": 2, "orientation": "portrait"
+    },
+    "Labo — 4 rijen × 2 banken × 4 stoelen": {
         "regular": True, "rows": 4, "banks": 2, "seats": 4, "orientation": "landscape"
     },
-    "Fysica T121 — top 4 banken gecentreerd, dan 3×3 banken (3 stoelen)": {
+    "Lokaal X — 3 rijen × (3-2-2-3 stoelen)": {
+        "regular": False,
+        "pattern": [[3,2,2,3], [3,2,2,3], [3,2,2,3], [3,2,2,3]],
+        "orientation": "landscape",
+        "center_first_row": True
+    },
+    "Lokaal Y — 3 rijen × 3 banken × 3 stoelen + rij met 4 stoelen": {
         "regular": False,
         "pattern": [[4], [3,3,3], [3,3,3], [3,3,3]],
         "orientation": "landscape",
         "center_first_row": True
+    },
+    "Lokaal Z — 3 rijen × 5 banken × 2 stoelen": {
+        "regular": True, "rows": 3, "banks": 5, "seats": 2, "orientation": "landscape"
     },
     "Eigen opstelling": {
         "regular": True, "rows": 4, "banks": 3, "seats": 2, "orientation": "portrait"
@@ -105,6 +142,157 @@ def safe_filename(s):
     keep = "-_.() abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
     return "".join(c for c in s if c in keep).replace(" ", "_")
 
+def _safe_extract_zipfileobj(zipfile_obj, target_dir):
+    """
+    Extract a ZipFile object (zipfile.ZipFile instance) safely into target_dir,
+    preventing path traversal.
+    """
+    for member in zipfile_obj.namelist():
+        normalized = os.path.normpath(member)
+        # skip absolute or parent-traversal entries
+        if normalized.startswith("..") or os.path.isabs(normalized):
+            continue
+        dest_path = os.path.join(target_dir, normalized)
+        dest_dir = os.path.dirname(dest_path)
+        os.makedirs(dest_dir, exist_ok=True)
+        # if it's a directory entry, make sure it exists
+        if member.endswith("/") or member.endswith("\\"):
+            os.makedirs(dest_path, exist_ok=True)
+            continue
+        with zipfile_obj.open(member) as src, open(dest_path, "wb") as out:
+            shutil.copyfileobj(src, out)
+
+def veilige_unzip(zip_path, target_dir):
+    """
+    Safely try to unpack zip_path into target_dir.
+    Strategies (in order):
+      1) Try reading zip bytes into memory and extract from BytesIO (avoids file-copy locks).
+      2) If (1) fails, copy to a temporary file and extract from there.
+    Returns True on success, False on failure.
+    """
+    try:
+        if not os.path.isfile(zip_path):
+            return False
+
+        # Ensure target_dir created or empty
+        if os.path.isdir(target_dir):
+            # try to test write/read permission on target_dir
+            try:
+                testfile = os.path.join(target_dir, ".write_test")
+                with open(testfile, "w") as tf:
+                    tf.write("test")
+                os.unlink(testfile)
+            except PermissionError as e:
+                messagebox.showerror("Assets", f"Geen schrijfrechten in doelmap {target_dir}:\n{e}")
+                return False
+        else:
+            try:
+                os.makedirs(target_dir, exist_ok=True)
+            except Exception as e:
+                messagebox.showerror("Assets", f"Kon doelmap niet aanmaken {target_dir}:\n{e}")
+                return False
+
+        # First attempt: read zip into memory and extract from bytes (often works even when copy fails)
+        try:
+            with open(zip_path, "rb") as f:
+                data = f.read()
+            with zipfile.ZipFile(io.BytesIO(data), "r") as zf:
+                _safe_extract_zipfileobj(zf, target_dir)
+            #messagebox.showinfo("Assets", f"✅ Assets uitgepakt naar {target_dir}")
+            return True
+        except PermissionError as pe:
+            # direct permission error reading zip — report and don't continue
+            messagebox.showerror("Assets", f"Toegang geweigerd bij lezen van zip-bestand:\n{pe}")
+            return False
+        except Exception:
+            # try fallback with temporary copy
+            try:
+                tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".zip")
+                tmp.close()
+                shutil.copy2(zip_path, tmp.name)
+                with zipfile.ZipFile(tmp.name, "r") as zf:
+                    _safe_extract_zipfileobj(zf, target_dir)
+                #messagebox.showinfo("Assets", f"✅ Assets uitgepakt naar {target_dir} (via tijdelijke kopie)")
+                return True
+            except PermissionError as pe2:
+                messagebox.showerror("Assets", f"Toegang geweigerd bij kopiëren/extractie van zip:\n{pe2}")
+                return False
+            except Exception as e2:
+                messagebox.showwarning("Assets", f"Fout bij uitpakken assets: {e2}")
+                return False
+            finally:
+                try:
+                    if 'tmp' in locals() and tmp is not None:
+                        os.unlink(tmp.name)
+                except Exception:
+                    pass
+
+    except Exception as final_e:
+        messagebox.showwarning("Assets", f"Fout bij uitpakken assets: {final_e}")
+        return False
+
+def prepare_assets_for_loading(assets_dir, zip_path):
+    """
+    Zorg dat we werken met een LOKALE, betrouwbare kopie van de assets.
+    - Als assets_dir bestaat: kopieer alle bestanden naar een tijdelijke map (lokale kopie).
+    - Als zip_path bestaat: pak de zip veilig uit naar een tijdelijke map.
+    Returned: pad naar tijdelijke map (dat de caller moet verwijderen wanneer klaar), of None bij fout.
+    """
+    # Create a temp working dir
+    tmpdir = None
+    try:
+        tmpdir = tempfile.mkdtemp(prefix="kls_assets_")
+        # If assets_dir exists, copy files to tmpdir by reading bytes (safer with OneDrive placeholders)
+        if os.path.isdir(assets_dir):
+            try:
+                for fname in os.listdir(assets_dir):
+                    src = os.path.join(assets_dir, fname)
+                    dst = os.path.join(tmpdir, fname)
+                    # skip directories unless we want to preserve subfolders
+                    if os.path.isdir(src):
+                        # replicate directory structure
+                        shutil.copytree(src, dst, dirs_exist_ok=True)
+                        continue
+                    # read bytes and write to dst to avoid some lock/copy pitfalls
+                    with open(src, "rb") as fr:
+                        data = fr.read()
+                    with open(dst, "wb") as fw:
+                        fw.write(data)
+                return tmpdir
+            except PermissionError as pe:
+                messagebox.showerror("Assets", f"Toegang geweigerd bij kopiëren van assets-map:\n{pe}\nLoad geannuleerd.")
+                try: shutil.rmtree(tmpdir, ignore_errors=True)
+                except Exception: pass
+                return None
+            except Exception as e:
+                # Something else failed while copying; cleanup and abort
+                messagebox.showerror("Assets", f"Fout bij kopiëren van assets naar tijdelijke map:\n{e}\nLoad geannuleerd.")
+                try: shutil.rmtree(tmpdir, ignore_errors=True)
+                except Exception: pass
+                return None
+
+        # If here, assets_dir not present but maybe zip exists
+        if os.path.isfile(zip_path):
+            # extract zip into tmpdir using veilige_unzip
+            ok = veilige_unzip(zip_path, tmpdir)
+            if ok:
+                return tmpdir
+            else:
+                try: shutil.rmtree(tmpdir, ignore_errors=True)
+                except Exception: pass
+                return None
+
+        # neither assets dir nor zip -> nothing to prepare
+        try: shutil.rmtree(tmpdir, ignore_errors=True)
+        except Exception: pass
+        return None
+    except Exception as e:
+        if tmpdir:
+            try: shutil.rmtree(tmpdir, ignore_errors=True)
+            except Exception: pass
+        messagebox.showerror("Assets", f"Onverwachte fout bij voorbereiden assets: {e}")
+        return None
+
 class SeatPlanner:
     def __init__(self, root):
         self.root = root
@@ -130,6 +318,9 @@ class SeatPlanner:
         self.seat_size = 100
         self.zoom_level = 1.0
         self.drag = {"student": None, "offset": (0,0)}
+        
+        # cache van per-PDF per-page checkbox-waarden (wordt weggeschreven bij save en herladen bij load)
+        self._last_pdf_multiline_rows = {}
 
         # icons
         self.load_icons()
@@ -141,32 +332,32 @@ class SeatPlanner:
         btn_font = ("Helvetica", 10)
         btn_font_bold = ("Helvetica", 10, "bold")
 
-        tk.Button(top_buttons, text="  Foto's uit map", image=self.ic_camera, compound="left",
+        tk.Button(top_buttons, text=" Foto's uit map", image=self.ic_camera, compound="left",
                   command=self.load_from_folder, bg="#D7EEF9", fg="black", bd=1, relief="raised",
                   padx=6, pady=4, font=btn_font).pack(side=tk.LEFT, padx=4)
 
-        tk.Button(top_buttons, text="  Foto's uit PDF", image=self.ic_camera, compound="left",
+        tk.Button(top_buttons, text=" Foto's uit PDF", image=self.ic_camera, compound="left",
                   command=self.load_from_pdf_and_names, bg="#D7EEF9", fg="black", bd=1, relief="raised",
                   padx=6, pady=4, font=btn_font).pack(side=tk.LEFT, padx=4)
 
-        tk.Button(top_buttons, text="  Shuffle", image=self.ic_herh, compound="left",
+        tk.Button(top_buttons, text=" Shuffle", image=self.ic_herh, compound="left",
                   command=self.shuffle_students, bg="#FDE5C6", fg="black", bd=1, relief="raised",
                   padx=6, pady=4, font=btn_font).pack(side=tk.LEFT, padx=4)
 
-        tk.Button(top_buttons, text="  Opslaan opstelling", image=self.ic_opslaan, compound="left",
-                  command=self.save_seating, bg="#DFF3DF", fg="black", bd=1, relief="raised",
-                  padx=6, pady=4, font=btn_font).pack(side=tk.LEFT, padx=4)
-
-        tk.Button(top_buttons, text="  Open opstelling", image=self.ic_open, compound="left",
+        tk.Button(top_buttons, text=" Open verdeling", image=self.ic_open, compound="left",
                   command=self.load_seating, bg="#DFF3DF", fg="black", bd=1, relief="raised",
                   padx=6, pady=4, font=btn_font).pack(side=tk.LEFT, padx=4)
 
-        tk.Button(top_buttons, text="  Export PDF", image=self.ic_outbox, compound="left",
+        tk.Button(top_buttons, text=" Opslaan verdeling", image=self.ic_opslaan, compound="left",
+                  command=self.save_seating, bg="#DFF3DF", fg="black", bd=1, relief="raised",
+                  padx=6, pady=4, font=btn_font).pack(side=tk.LEFT, padx=4)
+
+        tk.Button(top_buttons, text=" Exporteer PDF", image=self.ic_outbox, compound="left",
                   command=self.export_pdf, bg="#FFF7CC", fg="black", bd=1, relief="raised",
                   padx=6, pady=4, font=btn_font_bold).pack(side=tk.LEFT, padx=4)
 
         # Reset (clear board) button — rechts van Export PDF
-        tk.Button(top_buttons, text="  Reset", image=self.ic_reset, compound="left",
+        tk.Button(top_buttons, text=" Reset", image=self.ic_reset, compound="left",
                   command=self.reset_board, bg="#F8D7DA", fg="black", bd=1, relief="raised",
                   padx=6, pady=4, font=btn_font).pack(side=tk.LEFT, padx=4)
 
@@ -278,8 +469,8 @@ class SeatPlanner:
         except Exception:
             pass
         W,_ = self.page_size
-        # draw title with zoom applied visually
-        self.canvas.create_text((W/2)*self.zoom_level, 24*self.zoom_level,
+        # draw title with zoom applied visually and using TITLE_Y for consistency
+        self.canvas.create_text((W/2)*self.zoom_level, TITLE_Y*self.zoom_level,
                                 text=f"Klas {self.var_class.get()} — Lokaal {self.var_room.get()}",
                                 font=("Helvetica", int(16*self.zoom_level), "bold"), tags=("title",))
 
@@ -376,28 +567,126 @@ class SeatPlanner:
             })
         self.reflow_after_data_change()
 
+    def _convert_pdf_pages(self, pdf_path):
+        """
+        Probeer de PDF veilig te converteren naar PIL.Image pagina's.
+        - Eerst: probeer convert_from_bytes door het bestand in geheugen te lezen.
+        - Fallback: maak tijdelijke kopie en gebruik convert_from_path.
+        Returned: lijst van PIL Images of raise Exception.
+        """
+        if not os.path.isfile(pdf_path):
+            raise FileNotFoundError(f"PDF niet gevonden: {pdf_path}")
+        # try convert_from_bytes (safe when file can be read)
+        try:
+            with open(pdf_path, "rb") as f:
+                data = f.read()
+            pages = convert_from_bytes(data, dpi=PDF_DPI)
+            if pages:
+                return pages
+        except Exception:
+            # fall through to temp-copy approach
+            pass
+
+        # fallback: create temporary copy, use convert_from_path (useful if original is locked for direct access)
+        tmp = None
+        try:
+            tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".pdf")
+            tmp.close()
+            shutil.copy2(pdf_path, tmp.name)
+            pages = convert_from_path(tmp.name, dpi=PDF_DPI)
+            if pages:
+                return pages
+            raise Exception("Geen pagina's gevonden in PDF (fallback).")
+        finally:
+            if tmp is not None:
+                try:
+                    os.unlink(tmp.name)
+                except Exception:
+                    pass
+
     def load_from_pdf_and_names(self):
         pdf_path = filedialog.askopenfilename(filetypes=[("PDF", "*.pdf")], title="Kies PDF met foto's")
         if not pdf_path:
             return
+
         try:
-            pages = convert_from_path(pdf_path, dpi=PDF_DPI)
+            pages = self._convert_pdf_pages(pdf_path)
         except Exception as e:
             messagebox.showerror("PDF fout", f"Kon PDF niet lezen:\n{e}")
             return
-        page = pages[0].convert("RGB")
+        if not pages:
+            messagebox.showerror("PDF fout", "PDF bevat geen pagina's.")
+            return
+
+        # aantal foto's per rij/kolom op een pagina (vaste layout: 5x5 -> 25 per pagina)
+        COLS_PER_PAGE = 5
+        ROWS_PER_PAGE = 5
+        PHOTOS_PER_PAGE = COLS_PER_PAGE * ROWS_PER_PAGE  # 25
+
+        # tweede-pagina Y-start zoals gevraagd (263) — eerste pagina gebruikt PDF_MARGIN_TOP (319)
+        PDF_SECOND_PAGE_TOP = 263
+        delta_top = PDF_SECOND_PAGE_TOP - PDF_MARGIN_TOP
+
         N = simpledialog.askinteger("Aantal leerlingen", "Hoeveel leerlingen staan op de PDF?", minvalue=1, maxvalue=200, parent=self.root)
         if not N:
             return
         names = self.prompt_names_list(count=N)
+        
+        # bepaal hoeveel pagina's nodig zijn en vraag per pagina enkel het aantal benodigde rijen
+        pages_needed = (N + PHOTOS_PER_PAGE - 1) // PHOTOS_PER_PAGE
+        multiline_rows_per_page = []
+        for p in range(pages_needed):
+            items_on_page = N - p * PHOTOS_PER_PAGE
+            items_on_page = min(PHOTOS_PER_PAGE, max(0,items_on_page))
+            rows_present = (items_on_page + COLS_PER_PAGE - 1) // COLS_PER_PAGE  # 0..5
+            rows_to_query = max(0, rows_present - 1)
+            if rows_to_query > 0 and (p == 0 or (p >= 1 and N > 30)):
+                vals = self.prompt_multiline_rows(rows=rows_to_query, page_num=p+1)
+            else:
+                vals = [False]*rows_to_query
+            multiline_rows_per_page.append(vals)
+            
+        # **cache** de per-PDF keuze zodat we die bij opslaan kunnen bewaren
+        self._last_pdf_multiline_rows[pdf_path] = multiline_rows_per_page
+        
         for i in range(N):
-            r = i // PDF_COLS
-            c = i % PDF_COLS
+            # bepaal van welke PDF-pagina dit item komt en de rij/kolom binnen die pagina
+            page_index = i // PHOTOS_PER_PAGE
+            idx_in_page = i % PHOTOS_PER_PAGE
+            r = idx_in_page // COLS_PER_PAGE
+            c = idx_in_page % COLS_PER_PAGE
+
+            if page_index >= len(pages):
+                messagebox.showerror("PDF fout", f"PDF heeft niet genoeg pagina's voor {N} leerlingen (ontbreekt pagina {page_index+1}).")
+                return
+
+            # bepaal page-specifieke top offset (pagina 0 = PDF_MARGIN_TOP, pagina 1 = PDF_MARGIN_TOP + delta_top, ...)
+            if page_index == 0:
+                page_margin_top_for_this_page = PDF_MARGIN_TOP
+            else:
+                page_margin_top_for_this_page = PDF_MARGIN_TOP + page_index * delta_top
+
+            # bereken cumulatieve extra shift voor deze rij: elke aangevinkte eerdere rij → +33 px
+            extra_shift = 0
+            if page_index < len(multiline_rows_per_page):
+                page_checks = multiline_rows_per_page[page_index]
+                extra_shift = sum(1 for j in range(0, r) if j < len(page_checks) and page_checks[j]) * 33
+
+            page_img = pages[page_index].convert("RGB")
             x1 = PDF_MARGIN_LEFT + c * (PDF_PHOTO_W + PDF_H_SPACING)
-            y1 = PDF_MARGIN_TOP + r * (PDF_PHOTO_H + PDF_V_SPACING)
+            y1 = page_margin_top_for_this_page + r * (PDF_PHOTO_H + PDF_V_SPACING) + extra_shift
             x2 = x1 + PDF_PHOTO_W
             y2 = y1 + PDF_PHOTO_H
-            crop = page.crop((x1, y1, x2, y2))
+
+            # safety: clamp crop inside page bounds and add a small padding to avoid cutting edges
+            Wp, Hp = page_img.size
+            pad = 2
+            x1c = max(0, min(Wp, int(round(x1)) - pad))
+            y1c = max(0, min(Hp, int(round(y1)) - pad))
+            x2c = max(0, min(Wp, int(round(x2)) + pad))
+            y2c = max(0, min(Hp, int(round(y2)) + pad))
+
+            crop = page_img.crop((x1c, y1c, x2c, y2c))
             pil_sq = self.crop_square(crop)
             name = names[i] if i < len(names) else f"leerling_{i+1}"
             self.students.append({
@@ -406,6 +695,7 @@ class SeatPlanner:
                 "source": pdf_path, "pdf_index": i, "img_filename": None
             })
         self.reflow_after_data_change()
+
 
     def prompt_names_list(self, count=None, default_list=None):
         top = tk.Toplevel(self.root)
@@ -431,6 +721,49 @@ class SeatPlanner:
         ttk.Button(btns, text="Annuleren", command=cancel).pack(side=tk.LEFT, padx=6)
         top.wait_window()
         return result["names"] or []
+    
+    def prompt_multiline_rows(self, rows=5, page_num=None):
+        """
+        Toon een klein venster met 'rows' aantal checkboxen (default 5).
+        Elke aangevinkte rij betekent: alle daaropvolgende rijen krijgen +33 px extra y-offset.
+        Standaard zijn alle vinkjes uit. Retourneert een lijst van booleans (lengte rows).
+        Als gebruiker annuleert of sluit -> returneert [False]*rows.
+        """
+        top = tk.Toplevel(self.root)
+        title = f"Lange namen op pagina {page_num}" if page_num else "Lange namen per rij?"
+        top.title(title)
+
+        top.grab_set()
+        
+        intro = ("Soms zijn namen in de klaslijst zo lang dat ze op twee regels staan.\n"
+                       "Vink de rijen aan waar dit het geval is om de juiste uitsnijding te bekomen.")
+        tk.Label(top, wraplength=480, justify="left", text=intro).pack(anchor="w", padx=10, pady=(8,4))
+
+        vars = []
+        frame = tk.Frame(top)
+        frame.pack(padx=8, pady=4, anchor="w")
+        for i in range(rows):
+            v = tk.IntVar(value=0)
+            cb = tk.Checkbutton(frame, text=f"Rij {i+1}", variable=v)
+            cb.pack(anchor="w")
+            vars.append(v)
+
+        result = {"vals": [False]*rows}
+        def on_ok():
+            result["vals"] = [bool(v.get()) for v in vars]
+            top.destroy()
+        def on_cancel():
+            result["vals"] = [False]*rows
+            top.destroy()
+
+        btns = tk.Frame(top)
+        btns.pack(pady=(6,10))
+        ttk.Button(btns, text="OK", command=on_ok).pack(side=tk.LEFT, padx=6)
+        ttk.Button(btns, text="Annuleren", command=on_cancel).pack(side=tk.LEFT, padx=6)
+
+        top.wait_window()
+        return result["vals"]
+
 
     # ---------------- Helpers ----------------
     def crop_square(self, pil_img):
@@ -458,6 +791,10 @@ class SeatPlanner:
         """
         Compute both base (export) geometry based on logical seat_size,
         and display geometry according to zoom_level.
+
+        Extra: limit the portrait-start-Y so it never becomes much lower than
+        the equivalent centered start-Y for the same layout in landscape.
+        That keeps the title-to-first-bank spacing comparable.
         """
         # Clear canvas items
         self.canvas.delete("all")
@@ -469,6 +806,10 @@ class SeatPlanner:
         W, H = self.page_size
         cfg = LAYOUTS[self.var_layout.get()]
         regular = cfg.get("regular", True)
+        orient = cfg.get("orientation", "portrait")
+
+        # pick top margin based on orientation (this fixes extra whitespace in portrait)
+        page_margin_top = PAGE_MARGIN_TOP_PORTRAIT if orient == "portrait" else PAGE_MARGIN_TOP_LANDSCAPE
 
         if regular:
             rows = cfg["rows"]
@@ -493,7 +834,7 @@ class SeatPlanner:
         seat_by_w = (avail_w / max_banks - 2*INNER_PAD_X - (seats_per_bank_for_width-1)*SEAT_SPACING) / max(seats_per_bank_for_width,1)
 
         font_est = 14
-        avail_h = H - PAGE_MARGIN_TOP - PAGE_MARGIN_BOTTOM - (rows-1)*ROW_SPACING
+        avail_h = H - page_margin_top - PAGE_MARGIN_BOTTOM - (rows-1)*ROW_SPACING
         seat_by_h = avail_h/rows - (INNER_PAD_TOP + CAPTION_GAP + font_est + INNER_PAD_BOTTOM)
 
         # base logical seat_size used for export
@@ -504,10 +845,29 @@ class SeatPlanner:
         bank_h_base = int(INNER_PAD_TOP + self.seat_size + CAPTION_GAP + font_est + INNER_PAD_BOTTOM)
 
         # Build base geometry
-        y_base = PAGE_MARGIN_TOP + max(0, (H - PAGE_MARGIN_TOP - PAGE_MARGIN_BOTTOM - (rows*bank_h_base + (rows-1)*ROW_SPACING))//2)
-        title_y = 24
-        if y_base < title_y + 10:
-            y_base = title_y + 16
+        # centered y as before
+        centered_y_base = page_margin_top + max(0, (H - page_margin_top - PAGE_MARGIN_BOTTOM - (rows*bank_h_base + (rows-1)*ROW_SPACING))//2)
+        y_base = centered_y_base
+
+        # also compute what the centered start Y would be for the SAME layout in landscape A4
+        # (this allows us to cap portrait-start so it won't be much lower than landscape)
+        try:
+            _, landscape_H = landscape(A4)
+            alt_page_margin_top = PAGE_MARGIN_TOP_LANDSCAPE
+            alt_centered = alt_page_margin_top + max(0, (landscape_H - alt_page_margin_top - PAGE_MARGIN_BOTTOM - (rows*bank_h_base + (rows-1)*ROW_SPACING))//2)
+            # allow a small slack so portrait can be a bit lower if needed
+            max_allowed_y_base = alt_centered + 6
+            # cap y_base so it doesn't drop far below the landscape equivalent
+            if y_base > max_allowed_y_base:
+                y_base = max_allowed_y_base
+        except Exception:
+            # if anything goes wrong, keep original centered value
+            pass
+
+        # ensure banks don't start so low that there's an excessive gap below the title
+        min_allowed = TITLE_Y + TITLE_GAP_AFTER
+        if y_base < min_allowed:
+            y_base = min_allowed
 
         for r in range(rows):
             row_banks = banks_per_row[r]
@@ -540,9 +900,22 @@ class SeatPlanner:
             return int(2*INNER_PAD_X + seats*vs + (seats-1)*SEAT_SPACING)
         bank_h_disp = int(INNER_PAD_TOP + vs + CAPTION_GAP + font_est + INNER_PAD_BOTTOM)
 
-        y_disp = PAGE_MARGIN_TOP*self.zoom_level + max(0, int((H*self.zoom_level - (PAGE_MARGIN_TOP*self.zoom_level + PAGE_MARGIN_BOTTOM*self.zoom_level) - (rows*bank_h_disp + (rows-1)*int(ROW_SPACING*self.zoom_level)))//2))
-        if y_disp < title_y*self.zoom_level + 10:
-            y_disp = title_y*self.zoom_level + 16
+        # compute displayed y starting point using the same page_margin_top (scaled)
+        centered_y_disp = page_margin_top*self.zoom_level + max(0, int((H*self.zoom_level - (page_margin_top*self.zoom_level + PAGE_MARGIN_BOTTOM*self.zoom_level) - (rows*bank_h_disp + (rows-1)*int(ROW_SPACING*self.zoom_level)))//2))
+        y_disp = centered_y_disp
+
+        # compute landscape-equivalent display start and cap similarly
+        try:
+            _, landscape_H = landscape(A4)
+            alt_centered_disp = PAGE_MARGIN_TOP_LANDSCAPE*self.zoom_level + max(0, int((landscape_H*self.zoom_level - (PAGE_MARGIN_TOP_LANDSCAPE*self.zoom_level + PAGE_MARGIN_BOTTOM*self.zoom_level) - (rows*bank_h_disp + (rows-1)*int(ROW_SPACING*self.zoom_level)))//2))
+            max_allowed_y_disp = alt_centered_disp + (6 * self.zoom_level)
+            if y_disp > max_allowed_y_disp:
+                y_disp = int(max_allowed_y_disp)
+        except Exception:
+            pass
+
+        if y_disp < TITLE_Y*self.zoom_level + TITLE_GAP_AFTER:
+            y_disp = TITLE_Y*self.zoom_level + TITLE_GAP_AFTER
 
         for r in range(rows):
             row_banks = banks_per_row[r]
@@ -579,6 +952,7 @@ class SeatPlanner:
         else:
             self.canvas.config(scrollregion=(0,0,W*self.zoom_level,H*self.zoom_level))
 
+    # ---------------- Thumbnail building / drawing ----------------
     def build_tk_thumbs(self):
         vs = max(4, int(self.seat_size * self.zoom_level))
         for s in self.students:
@@ -630,6 +1004,7 @@ class SeatPlanner:
         self.build_tk_thumbs()
         self.auto_assign_students()
         self.draw_students()
+
 
     # ---------------- Drag & Drop ----------------
     def find_student_by_img(self, item_id):
@@ -769,8 +1144,8 @@ class SeatPlanner:
         if not self.selected_student:
             return
         s = self.selected_student
-        if s.get("img_id"): self.canvas.delete(s["img_id"])
-        if s.get("text_id"): self.canvas.delete(s["text_id"])
+        if s.get("img_id"): self.canvas.delete(s.get("img_id"))
+        if s.get("text_id"): self.canvas.delete(s.get("text_id"))
         self.students.remove(s)
         self.selected_student = None
         self.reflow_after_data_change()
@@ -817,7 +1192,8 @@ class SeatPlanner:
             "room": self.var_room.get(),
             "layout": self.var_layout.get(),
             "custom_layout": LAYOUTS.get("Eigen opstelling"),
-            "students": students_meta
+            "students": students_meta,
+            "pdf_multiline_rows": self._last_pdf_multiline_rows
         }
 
         # write JSON and create ZIP of assets, then remove the assets_dir
@@ -833,6 +1209,29 @@ class SeatPlanner:
             messagebox.showinfo("Opslaan", f"Opstelling opgeslagen in:\n{fpath}\n(en assets gecomprimeerd in {os.path.basename(zip_path)})")
         except Exception as e:
             messagebox.showerror("Fout", f"Kon niet opslaan:\n{e}")
+
+    def _safe_read_json(self, fpath):
+        """
+        Probeer JSON te lezen. Als openen direct faalt (bv door lock), maak tijdelijke kopie en lees die.
+        Returned: parsed data or raise.
+        """
+        try:
+            with open(fpath, "r", encoding="utf-8") as f:
+                return json.load(f)
+        except Exception:
+            tmp = None
+            try:
+                tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".json")
+                tmp.close()
+                shutil.copy2(fpath, tmp.name)
+                with open(tmp.name, "r", encoding="utf-8") as f2:
+                    return json.load(f2)
+            finally:
+                if tmp is not None:
+                    try:
+                        os.unlink(tmp.name)
+                    except Exception:
+                        pass
 
     def load_seating(self):
         # if there are existing students, ask user whether to save before opening
@@ -851,22 +1250,18 @@ class SeatPlanner:
         assets_dir = base + "_assets"
         zip_path = base + "_assets.zip"
         try:
-            with open(fpath, "r", encoding="utf-8") as f:
-                data = json.load(f)
+            data = self._safe_read_json(fpath)
         except Exception as e:
             messagebox.showerror("Fout", f"Kon bestand niet lezen:\n{e}")
             return
+        # keep cached pdf-multiline rows if present but we don't use them for fallback cropping anymore
+        self._last_pdf_multiline_rows = data.get("pdf_multiline_rows", {}) or {}
 
-        # extract zip if present
-        try:
-            if os.path.isfile(zip_path):
-                if os.path.isdir(assets_dir):
-                    shutil.rmtree(assets_dir)
-                os.makedirs(assets_dir, exist_ok=True)
-                with zipfile.ZipFile(zip_path, "r") as zf:
-                    zf.extractall(assets_dir)
-        except Exception as e:
-            messagebox.showwarning("Assets", f"Fout bij uitpakken assets: {e}")
+        # --- NEW: Prepare a local working copy of assets (temporary dir)
+        working_assets = prepare_assets_for_loading(assets_dir, zip_path)
+        if working_assets is None:
+            # prepare_assets_for_loading already showed an error; abort load
+            return
 
         # restore custom layout if present
         custom = data.get("custom_layout")
@@ -883,7 +1278,7 @@ class SeatPlanner:
 
         saved_students = data.get("students", [])
 
-        # CLEAR current state completely (user chose to open a file)
+        # CLEAR current state completely (we're now ready)
         self.students = []
         self.canvas.delete("all")
         self.base_slots.clear()
@@ -894,49 +1289,47 @@ class SeatPlanner:
         # Rebuild base layout first to know slots
         self.set_layout()
 
+        # Build students list reading images only from working_assets. NO PDF fallback.
+        missing_images = []
         new_students = []
-        for i, meta in enumerate(saved_students):
-            img_pil = None
-            imgfile = meta.get("img_filename")
-            if imgfile:
-                p = os.path.join(assets_dir, imgfile)
-                if os.path.isfile(p):
-                    try:
-                        img_pil = Image.open(p).convert("RGB")
-                    except Exception:
-                        img_pil = None
-            # fallback: try to recover from source (image file or pdf)
-            if img_pil is None and meta.get("source"):
-                src = meta["source"]
-                if os.path.isfile(src) and src.lower().endswith(".pdf") and isinstance(meta.get("pdf_index"), int):
-                    try:
-                        pages = convert_from_path(src, dpi=PDF_DPI)
-                        page = pages[0].convert("RGB")
-                        iidx = meta["pdf_index"]
-                        r = iidx // PDF_COLS
-                        c = iidx % PDF_COLS
-                        x1 = PDF_MARGIN_LEFT + c * (PDF_PHOTO_W + PDF_H_SPACING)
-                        y1 = PDF_MARGIN_TOP + r * (PDF_PHOTO_H + PDF_V_SPACING)
-                        x2 = x1 + PDF_PHOTO_W
-                        y2 = y1 + PDF_PHOTO_H
-                        crop = page.crop((x1,y1,x2,y2))
-                        img_pil = self.crop_square(crop)
-                    except Exception:
-                        img_pil = None
-                elif os.path.isfile(src):
-                    try:
-                        img_pil = Image.open(src).convert("RGB")
-                        img_pil = self.crop_square(img_pil)
-                    except Exception:
-                        img_pil = None
-            if img_pil is None:
-                img_pil = Image.new("RGB", (self.seat_size, self.seat_size), (240,240,240))
-            name = meta.get("name", f"leerling_{i+1}")
-            new_students.append({
-                "name": name, "pil": img_pil, "tk": None, "slot": meta.get("slot"),
-                "img_id": None, "text_id": None, "font_size": meta.get("font_size", FONT_MAX),
-                "source": meta.get("source"), "pdf_index": meta.get("pdf_index"), "img_filename": meta.get("img_filename")
-            })
+        try:
+            for i, meta in enumerate(saved_students):
+                img_pil = None
+                imgfile = meta.get("img_filename")
+                if imgfile:
+                    p = os.path.join(working_assets, imgfile)
+                    if os.path.isfile(p):
+                        # try a robust open: first Image.open, if fails try reading bytes
+                        try:
+                            img_pil = Image.open(p).convert("RGB")
+                        except Exception:
+                            try:
+                                with open(p, "rb") as fr:
+                                    data = fr.read()
+                                img_pil = Image.open(io.BytesIO(data)).convert("RGB")
+                            except Exception:
+                                img_pil = None
+                    else:
+                        missing_images.append(imgfile)
+                if img_pil is None:
+                    # If image missing in assets, use neutral placeholder but continue.
+                    img_pil = Image.new("RGB", (self.seat_size, self.seat_size), (240,240,240))
+                name = meta.get("name", f"leerling_{i+1}")
+                new_students.append({
+                    "name": name, "pil": img_pil, "tk": None, "slot": meta.get("slot"),
+                    "img_id": None, "text_id": None, "font_size": meta.get("font_size", FONT_MAX),
+                    "source": meta.get("source"), "pdf_index": meta.get("pdf_index"), "img_filename": meta.get("img_filename")
+                })
+        finally:
+            # cleanup temporary working assets dir (we have loaded PIL images into memory)
+            try:
+                shutil.rmtree(working_assets, ignore_errors=True)
+            except Exception:
+                pass
+
+        if missing_images:
+            messagebox.showwarning("Ontbrekende afbeeldingen", f"De volgende afbeeldingsbestanden ontbraken in de assets en zijn vervangen door placeholders:\n\n" + "\n".join(missing_images[:50]) + ("" if len(missing_images) <= 50 else f"\n... ({len(missing_images)-50} meer)"))
+
         # set students and redraw
         self.students = new_students
         self.reflow_after_data_change()
@@ -975,10 +1368,10 @@ class SeatPlanner:
         W,H = page
         c = pdfcanvas.Canvas(fpath, pagesize=page)
 
-        # Titel
+        # Titel (gebruik TITLE_Y zodat UI/PDF overeenkomen)
         c.setFont("Helvetica-Bold", 20)
         title = f"Klas {self.var_class.get()} — Lokaal {self.var_room.get()}"
-        c.drawCentredString(W/2, H-36, title)
+        c.drawCentredString(W/2, H - TITLE_Y, title)
 
         # Banken (use base bank rects)
         c.setLineWidth(1)
@@ -1046,3 +1439,4 @@ if __name__ == "__main__":
         pass
     app = SeatPlanner(root)
     root.mainloop()
+
