@@ -6,7 +6,7 @@ Compatibel met de klaslijst-PDF die Smartschool genereert.
 
 💻 Geprogrammeerd met veel input van mij, maar het zware werk gebeurde door **ChatGPT** 😉.  
 
-⚠️ **Verbeteringen en wijzigingen kan je via de code zelf uitvoeren. Ik zou het waarderen mocht je verbeteringen met me delen! :-) **
+⚠️ **Verbeteringen en wijzigingen kan je via de code zelf uitvoeren. Ik zou het waarderen mocht je verbeteringen met me delen!** :-) 
 
 ---
 
